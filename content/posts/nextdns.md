@@ -12,14 +12,6 @@ tags:
 weight: 1
 ---
 
----
-title: Configuración NextDNS en router Asus con firmware Merlin y en equipos Debian con NetworkManager
-date: 2023-10-20 09:00:00 +0100
-categories: [Network]
-tags: [config, network]     # TAG names should always be lowercase
-img_path: /assets/pictures/
-author: <noah>
----
 ## Instalación de Nextdns firmware Merlin router ASUS
 
 En el [github de Nextdns](https://github.com/nextdns/nextdns) tenemos toda la información para la instalación del NextDNS CLI Client en nuestro router. Este cliente emplea DNS-over-HTTPS.

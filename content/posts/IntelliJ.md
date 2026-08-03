@@ -10,15 +10,6 @@ tags:
 weight: 1
 ---
 
-
----
-title: Instalación de IDE IntelliJ
-date: 2023-06-16 22:00:00 +0100
-categories: [Programming]
-tags: [software, programming]     # TAG names should always be lowercase
-img_path: /pictures/
-author: <noah>
----
 ## Instalación del IDE de programación IntelliJ
 
 **Instalación mediante Flatpak**  

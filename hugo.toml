@@ -1,5 +1,5 @@
 baseURL = "https://blog.lasnotasdenoah.com"
-languageCode = "es-es"
+locale = "es-ES"
 title = "Las notas de Noah"
 theme = "PaperMod"
 
