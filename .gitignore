@@ -1,0 +1,7 @@
+# Hugo genera esto, no se versiona
+public/
+resources/
+.hugo_build.lock
+
+# Basura habitual del sistema
+.DS_Store

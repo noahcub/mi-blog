@@ -1,0 +1,390 @@
+---
+title: AdguardHome como servidor DNS
+description: Configuración de AdguardHome como servidor DNS en nuestro VPS
+date: 2026-04-04 07:00:00+02:00
+draft: false
+categories:
+   - Debian
+tags:
+   - Admin
+weight: 1
+---
+
+## Adguard Home
+  
+Según su web, [Adguard Home](https://adguard.com/es/welcome.html) es el primer bloqueador de anuncios para Linux a nivel de sistema en el mundo. Bloquea anuncios y rastreadores en el dispositivo, selecciona de los filtros preinstalados o añade los tuyos propios, todo a través de la interfaz de línea de comandos.  
+
+Características:  
+1.- Bloqueo de anuncios: El bloqueador de anuncios AdGuard elimina los molestos banners, ventanas emergentes y anuncios de vídeo.  
+2.- Protección de privacidad: El bloqueador de anuncios AdGuard protege tus datos de web analytics y los rastreadores online.  
+3.- Seguridad de navegación: El bloqueador de anuncios AdGuard protege contra el phishing y los sitios maliciosos.  
+4.- Control parental: El bloqueador de anuncios AdGuard protege a los niños del contenido adulto e inapropiado.  
+
+### Instalación en el VPS
+
+Usaremos docker como es habitual.
+```bash
+services:
+  adguardhome:
+    image: adguard/adguardhome:latest
+    container_name: adguardhome
+    restart: unless-stopped
+    ports:
+      # DNS (imprescindible)
+      - "53:53/tcp"
+      - "53:53/udp"
+      # Web UI - Solo para el primer arranque del contenedor - Luego lo comentamos
+#      - "3000:3000/tcp"
+      # DoT (DNS over TLS) nosotros vamos a usarlo
+      - "853:853/tcp"
+    volumes:
+      - ./conf:/opt/adguardhome/conf
+      - ./data:/opt/adguardhome/work
+      - ./certs:/opt/adguardhome/certs:ro
+
+    networks:
+      - infra_network # <--- Nuestra red de traefik
+
+  certs-extractor:
+    image: ldez/traefik-certs-dumper:v2.8.1
+    container_name: certs-extractor
+    entrypoint: sh -c "
+      traefik-certs-dumper file --watch --version v2 --source /data/acme.json --dest /output --domain-subdir &&
+      chmod -R 600 /output/*"
+    volumes:
+      - /home/noe/traefik-crowdsec/traefik/ssl/acme.json:/data/acme.json:ro  # Ruta a TU archivo acme.json
+      - ./certs:/output                         # Donde se guardarán los .pem
+    networks:
+      - infra_network # <--- Nuestra red de traefik
+
+networks:
+  infra_network:
+    external: true 
+```
+Nuestro stack consta de dos contenedores.
+1.- Adguardhome. Configuración sencilla. Solo es destacable que para el primer arranque mapeamos el puerto 3000 y una vez hecha la configuración inicial podemos comentarlo, ya que accederemos al panel a través de adguard.midominio.com. Aunque miestras escribo igual vuelvo a mapearlo para que solo sea accesible desde tailscale.  
+2.- Certs-extractor. Este contenedor se encarga de extraer los certificados de traefik para usar el DNS over TLS. Esta parte es muy importante porque traefik guarda los certificados juntos en el mismo fichero **acme.json**. Este docker se encarga de extraer los certificados que contiene acme.json en dos ficheros: **certificate.crt y privatekey.key**
+
+**En la configuración inicial se dejan todos los valores por defecto**. Lo único que tenemos que modificar es el usuario y la contraseña. 
+
+### Configuraciones en traefik
+
+Nos vamos a traefik para adaptarlo a nuestro Adguard Home.  
+
+Editamos nuestro fichero traefik.yml y añadimos un nuevo entrypoint para los DNS over TLS:
+```bash
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+#        certResolver: letsencrypt_staging
+
+        # Primer dominio
+        domains:
+          - main: "midominio.com"
+            sans:
+              - "*.midominio.com"
+        # Segundo dominio
+          - main: "lasnotasdenoah.com"
+            sans:
+              - "*.lasnotasdenoah.com"
+  # Entrypoint para dns adguard-home
+  dot:
+    address: ":853"
+```
+
+En nuestro directorio conf.d creamos el fichero dns.yml:
+```bash
+# Esta primera parte de http simplemente es el acceso al panel de adguard como cualquier otro servicio.
+http:
+  routers:
+    adguard-ui:
+      rule: "Host(`adguard.midominio.com`)"
+      service: adguard-ui
+      entryPoints:
+        - websecure
+      tls: {}   # o simplemente ‘tls: true’ en v3
+      # Protegemos nuestro panel con los middleware
+      middlewares:
+        - geoblock-es
+        - crowdsec-bouncer
+        - security-headers
+  services:
+    adguard-ui:
+      loadBalancer:
+        servers:
+          # Como estamos en la misma red docker, no hace falta poner dirección IP. Usamos el nombre del contenedor y traefik lo entiene perfectamente.
+          - url: "http://adguardhome:80"
+
+# Aquí configuramos la conexión DNS
+tcp:
+  routers:
+    adguard-dot:
+      rule: "HostSNI(`dns.midomnio.com`)"
+      service: adguard-dot
+      # Usamos el nuevo entryPoint que configuramos en traefik.yml por el puerto 853 que es el que usa DNS over TLS
+      entryPoints:
+        - dot
+      # IMPORTANTÍSIMO: Tenemos que forzar a ACME a generar este dominio. MOTIVO: identificar de forma individual los equipos que se pueden conectar y de rebote vemos las estadísticas de uso de cada uno
+      tls:
+        certResolver: letsencrypt
+        domains:  # ← Esto fuerza ACME para este dominio específico
+          - main: "dns.midominio.com"
+            sans:
+              - "*.dns.midominio.com"
+  services:
+    adguard-dot:
+      loadBalancer:
+        servers:
+          - address: "adguardhome:853"
+```
+
+```bash
+# Reiniciamos traefik
+docker compose restart traefik    
+
+# Verificamos los logs:
+docker logs traefik | grep -i acme                        
+```
+
+Y vemos la respuesta de traefik:
+```bash
+[...]
+2026-04-03T16:32:09+02:00 ERR Unable to obtain ACME certificate for domains error="unable to generate a certificate for the domains [*.dns.midominio.com]: error: one or more domains had a problem:\n[dns.midominio.com] [dns.midominio.com] acme: error presenting token: cloudflare: failed to create TXT record: An identical record already exists. (81058)\n" ACME CA=https://acme-v02.api.letsencrypt.org/directory acmeCA=https://acme-v02.api.letsencrypt.org/directory domains=["dns.midominio.com","*.dns.midominio.com"] providerName=letsencrypt.acme routerName=adguard-certs-helper@file rule=Host(`dns.midominio.com`)
+ERROR: CrowdsecBouncerTraefikPlugin: 2026/04/04 11:02:04 ServeHTTP:Get ip:88.58.78.148 cache:unreachable
+[...]
+```
+
+**Pasos para solucionar el error:**   
+Según Perplexity el error "An identical record already exists. (81058)" de Cloudflare DNS-01 es inofensivo (cert se genera igual), pero ensucia logs. Se soluciona borrando el TXT challenge persistente en Cloudflare.  
+
+1.- Entramos en nuestro panel de administración de cloudflare y borramos los txt de los registros DNS
+![adguard-1.png](adguard-1.png)
+
+2.- Limpieza de logs de traefik:
+```bash
+docker exec traefik truncate -s 0 /var/log/traefik/access.log
+docker exec traefik truncate -s 0 /var/log/traefik/traefik.log
+```
+
+3.- Añadimos a certificatesResolvers.letsencrypt.acme.dnsChallenge de traefik.yml:
+```bash
+dnsChallenge:
+  provider: cloudflare
+  delayBeforeCheck: 60      # Espera propagación
+  resolvers:
+    - "1.1.1.1:53"
+    - "8.8.8.8:53"
+```
+
+4.- Verificamos con:
+```bash
+docker logs traefik | grep acme
+# Debería dar un resultado sin errores acme
+```
+
+En [la parte 1 de configurar el VPS](https://blog.lasnotasdenoah.com/posts/vps-proxy/) tenía comentados los resolvers de traefik.yml:
+```bash
+        provider: cloudflare
+#        resolvers:
+#          - "1.1.1.1:53"
+#          - "1.0.0.1:53"
+```
+
+Consulté nuevamente a Perplexity sobre ese comentario y su respuesta fue que **es MUY importante descomentarlo para DNS-01 con Cloudflare. Esos resolvers le dicen a Traefik qué DNS públicos consultar para verificar que el TXT challenge se propagó antes de pedir el certificado.**   
+Beneficios inmediatos:  
+1.- Renovaciones ACME 2x más rápidas  
+2.- Cero errores "propagation timeout"  
+3.- Logs de Traefik impecables  
+4.- Rate limits Let’s Encrypt respetados  
+
+Así que toca descomentarlo para mejorar la estabilidad con certificados wildcards:
+```bash
+        provider: cloudflare
+        resolvers:
+          - "1.1.1.1:53"
+          - "1.0.0.1:53"
+```
+
+### Configuración panel Adguard Home
+
+En la siguiente imagen vemos el panel funcionando.
+![adguard-2.png](adguard-2.png)
+
+Configuración de cifrado:  
+1.- Marcamos el Check de Habilitar cifrado (DNS over TLS)  
+2.- Nombre del servidor: dns.midominio.com
+
+![adguard-3.png](adguard-3.png)
+
+Establecemos la ruta de los certificados. En mi caso:
+```bash
+# Archivo del certificado
+/opt/adguardhome//certs/*.dns.midominio.com/certificate.crt
+
+# Archivo de clave privada
+/opt/adguardhome//certs/*.dns.midominio.com/privatekey.key
+```
+
+Nos saldrá una confirmación en verde para decir que se han cargado correctamente:
+![adguard-4.png](adguard-4.png)
+
+### Configuración de clientes en Adguard Home
+
+En esta parte vamos a configurar los clientes que pueden realizar consultas DNS por nuestro servicio.  
+
+Esta es mi configuración
+![adguard-5.png](adguard-5.png)
+
+Importante:  
+1.- Nombre del cliente: nombre que nos guste para ver las estadísticas.  
+2.- Etiqueta: se puede seleccionar la que sea mas acorde al dispositivo.  
+3.- Identificador: esta es la parte mas importante. Identificador único por ejemplo: S24-XXXXXXXXXXX  
+
+Una vez configurados los clientes, tenemos que autorizarles el uso del DNS en Configuración DNS. **IMPORTANTE: En clientes permitidos ponemos el Identificador del cliente (NO el nombre)**
+![adguard-6.png](adguard-6.png)
+
+### Configuración de clientes en Linux
+
+```bash
+sudo nano /etc/systemd/resolved.conf
+
+# Añadimos lo siguiente:
+
+[Resolve]
+DNS=IP_PUBLICA_VPS#debian13-XXXXXXXXXXXX.dns.midominio.com
+FallbackDNS=9.9.9.9#dns.quad9.net
+Domains=~.
+DNSOverTLS=yes
+
+# Reiniciamos systemd-resolved
+sudo systemctl restart systemd-resolved.service
+```
+
+### Configuración de clientes en Android
+
+Vamos a Ajustes -> Conexiones -> Mas ajustes de conexión -> DNS privado:
+```bash
+s24-XXXXXXXXX.dns.midominio.com
+```
+![adguard-7.jpg](adguard-7.jpg)
+
+### Modificación para VPS en NetCUP
+
+Al cambiar mi VPS a NetCUP he tenido un problema con el firewall del propio netcup. Por motivos desconocidos el firewall bloqueaba los proveedores de DNS y no había manera de hacerlo funcionar. Daba igual las reglas que pusiera que netcup siempre bloqueaba cualquier comunicación a través del puerto DNS 53. La única forma de hacerlo funcionar era desactivando el firewall.  
+
+Preguntando a Claude encontré la solución para dejar activado el firewall de netcup y que funciona adguardhome sin problemas. Por cierto, era bastante sencilla y Gemini me estuvo volviendo loco con configuraciones muy extranñas. Y yo venga a decirle que el problema no era de mi debian 13, que era de netcup y erre que erre.  
+
+
+```bash
+# Simplemente tenemos que liberar a adguardhome de tener que hacer una consulta DNS para resolver dns.quad9.net.
+# Le damos la IP directamente y ya no tiene que hacer esa consulta.
+# Sustituimos:
+https://dns.quad9.net/dns-query
+# por:
+# Proveedores DNS
+https://9.9.9.10/dns-query
+https://149.112.112.10/dns-query
+tls://9.9.9.9
+tls://1.1.1.1
+
+# Servidores DNS de arranque
+9.9.9.9
+1.1.1.1
+```
+
+Quedando en mi caso de esta forma:
+![adguard-8.png](adguard-8.png)
+
+y los DNS de arranque:
+![adguard-9.png](adguard-9.png)
+
+### Actualización de certificados
+El otro día al abrir la interfaz de AdguardHome me doy cuenta que quedan pocos días para la caducidad del certificado y **certs-extractor** no ha renovado el certificado. Me di cuenta de este problema porque por motivos desconocidos traefik no había renovado mis certificados. El certificado que usa adguardhome caducaba unos días despues del certificado que se caducó pero tampoco se había renovado.  
+    
+Una vez solucionado el tema con traefik, vamos a forzar la actualización en adguardhome a través de certs-extractor.  
+Verificación de las fechas del certificado:
+```bash
+# Comprueba la fecha del cert que realmente tiene AdGuard en disco
+openssl x509 -noout -dates -in ~/adguard-home/certs/*.dns.midominio.com/certificate.crt
+```
+
+Reiniciamos cert-extractor:
+```bash
+cd adguard-home
+docker compose restart certs-extractor
+# Volvemos a verificar 
+openssl x509 -noout -dates -in ./certs/*.dns.midominio.com/certificate.crt
+```
+
+Ya deberíamos ver que el certificado es correcto.  
+
+Si nos diera fallo podemos borrar todo y que cree los datos de nuevo:
+```bash
+docker compose stop certs-extractor
+docker compose rm -f certs-extractor
+docker compose up -d certs-extractor
+```
+
+Ahora recargamos adguardhome para que actualice la fecha:
+```bash
+docker compose restart adguardhome
+```
+
+Por último, creamos una **tarea con crontab** para que reinicie nuestro certs-extractor:
+```bash
+# Reinicia el dumper cada día a las 5am para forzar re-extracción tras renovaciones
+0 5 * * * cd /home/noe/adguard-home && docker compose restart certs-extractor && sleep 30 && docker compose restart adguardhome
+```
+
+Yo voy a optar por una opción un poco más elegante. Ventajas sobre el cron simple de "siempre reiniciar ambos":
+
+- Solo reinicia AdGuard si el cert realmente cambió.
+- Deja log para  auditar cuándo se renovó cada cert.
+- Sigue siendo simple de leer y depurar.
+
+```bash
+0 5 * * * /home/noe/scripts/refresh-adguard-certs.sh >> /home/noe/scripts/refresh-adguard-certs.log 2>&1
+```
+
+```bash
+#!/bin/bash
+# /home/noe/scripts/refresh-adguard-certs.sh
+
+CERT="/home/noe/adguard-home/certs/*.dns.midominio.com/certificate.crt"
+
+# Fecha de expiración ANTES de tocar nada
+BEFORE=$(openssl x509 -noout -enddate -in "$CERT" 2>/dev/null | cut -d= -f2)
+
+cd /home/noe/adguard-home || exit 1
+docker compose restart certs-extractor
+sleep 15
+
+# Fecha de expiración DESPUÉS
+AFTER=$(openssl x509 -noout -enddate -in "$CERT" 2>/dev/null | cut -d= -f2)
+
+echo "$(date): antes=$BEFORE despues=$AFTER"
+
+if [ "$BEFORE" != "$AFTER" ]; then
+    echo "$(date): certificado actualizado, reiniciando AdGuard"
+    docker compose restart adguardhome
+else
+    echo "$(date): sin cambios, no se reinicia AdGuard"
+fi
+```
+
+***
+Fuentes:  
+**Debo decir que en esta guía he tirado mucho de IA.**   
+[Adguard Home](https://adguard.com/es/welcome.html)  
+[Configurar VPS parte 1](https://blog.lasnotasdenoah.com/posts/vps-proxy/)  
+[Configurar VPS parte 2](https://blog.lasnotasdenoah.com/posts/vps-proxy-parte2/)  

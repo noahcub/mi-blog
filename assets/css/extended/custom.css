@@ -1,0 +1,23 @@
+.toc {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--entry);
+    padding: 12px 20px;
+}
+.toc .details summary {
+    font-weight: 600;
+    font-size: 0.95em;
+}
+.toc ul {
+    list-style: none;
+    padding-left: 1em;
+    margin: 0;
+}
+.toc li::before {
+    content: "";
+}
+.toc a {
+    color: var(--primary);
+    opacity: 0.75;
+}
+.toc a:hover { opacity: 1; }
